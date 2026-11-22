@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>문경 중·고등 영어 기출 분석 &amp; 변형문제 생성기</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+KR:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -425,6 +427,22 @@
 
             <div id="pendingMaterialQueue" class="space-y-2.5 hidden"></div>
 
+            <!-- 원본 지문 직접 확인·보정 영역 (추출 실패/스캔 PDF 대비) -->
+            <div id="manualPassageFallbackBox" class="hidden rounded-2xl bg-slate-950/90 border border-amber-500/40 p-4 space-y-2.5">
+              <div class="flex items-center justify-between gap-2 flex-wrap">
+                <label for="manualPassageInput" class="text-xs font-bold text-amber-300">
+                  원본 지문 텍스트 확인 · 직접 붙여넣기 (스캔본/인식 보정용)
+                </label>
+                <span id="extractedPassageSummary" class="text-[11px] text-slate-400"></span>
+              </div>
+              <textarea
+                id="manualPassageInput"
+                rows="4"
+                placeholder="PDF/사진에서 텍스트가 자동 추출되지 않는 스캔본이거나 특정 번호의 지문을 직접 넣고 싶다면, 여기에 '29. 영어지문...' 또는 영어 지문을 붙여넣으세요. 입력 시 해당 원본 번호와 지문으로 100% 일치시켜 변형 출제합니다."
+                class="w-full rounded-xl bg-slate-900 border border-slate-700 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-400 leading-relaxed"
+              ></textarea>
+            </div>
+
             <button
               id="generateVariantsBtn"
               type="button"
@@ -507,7 +525,7 @@
         activeTab: 'analyze', // 'analyze' | 'generate'
         authorFilter: '__ALL__',
         pendingExamFiles: [], // { id, file, dataUrl, name, size }
-        pendingMaterialFiles: [], // { id, file, dataUrl, isPdf, name, size, originalNumbers }
+        pendingMaterialFiles: [], // { id, file, dataUrl, isPdf, isMockExam, name, size, originalNumbers, extractedQuestionsMap, extractionStatus }
         showAnswers: false,
         latestGeneratedSet: null,
         schools: {
@@ -547,7 +565,6 @@
             window.name = nextName;
             updateSaveBadge('세션 누적 저장됨', true);
           } else {
-            // 썸네일을 제외한 경량 상태로 저장
             const lightweightSchools = {};
             for (const school of ALL_SCHOOLS) {
               const s = state.schools[school];
@@ -643,6 +660,132 @@
           reader.onerror = () => reject(new Error('이미지를 읽을 수 없습니다.'));
           reader.readAsDataURL(file);
         });
+      }
+
+      // 파일 -> ArrayBuffer 변환 (PDF.js 텍스트 추출용)
+      function readFileAsArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error('PDF 파일을 읽을 수 없습니다.'));
+          reader.readAsArrayBuffer(file);
+        });
+      }
+
+      // PDF 파일에서 페이지별 전체 텍스트 추출
+      async function extractTextFromPdfFile(file) {
+        try {
+          if (!window.pdfjsLib) return '';
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          const buffer = await readFileAsArrayBuffer(file);
+          const loadingTask = window.pdfjsLib.getDocument({ data: buffer });
+          const pdf = await loadingTask.promise;
+          const pageTexts = [];
+          for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+            const page = await pdf.getPage(pageNum);
+            const content = await page.getTextContent();
+            const items = content.items || [];
+            let line = '';
+            let lastY = null;
+            for (const item of items) {
+              const str = item.str || '';
+              const y = item.transform ? item.transform[5] : null;
+              if (lastY !== null && y !== null && Math.abs(y - lastY) > 6) {
+                pageTexts.push(line.trim());
+                line = str;
+              } else {
+                line += (line && !line.endsWith(' ') && !str.startsWith(' ') ? ' ' : '') + str;
+              }
+              if (y !== null) lastY = y;
+            }
+            if (line.trim()) pageTexts.push(line.trim());
+          }
+          return pageTexts.join('\n');
+        } catch (err) {
+          return '';
+        }
+      }
+
+      // 이미지 파일에서 OCR 영어 텍스트 추출
+      async function extractTextFromImageDataUrl(dataUrl) {
+        try {
+          if (!window.Tesseract || !dataUrl) return '';
+          const result = await window.Tesseract.recognize(dataUrl, 'eng');
+          return (result && result.data && result.data.text) ? result.data.text : '';
+        } catch (err) {
+          return '';
+        }
+      }
+
+      // 추출된 원문 텍스트에서 문항 번호(18번 ~ 45번)별로 정확한 영어 지문 분리 매핑
+      function parseMockExamPassagesByNumber(rawText) {
+        const map = {};
+        if (!rawText || typeof rawText !== 'string') return map;
+
+        const cleaned = rawText
+          .replace(/\r\n/g, '\n')
+          .replace(/[①②③④⑤]/g, (m) => ` ${m} `)
+          .replace(/\n{3,}/g, '\n\n');
+
+        // 문항 시작 패턴: 줄 시작 또는 공백 뒤 "18." ~ "45." (또는 "18번", "[18~20]")
+        const markerRegex = /(?:^|\n)\s*(?:\[?\s*(\d{2})\s*[~～-]\s*(\d{2})\s*\]?|(\d{2})\s*(?:\.|번|\)))\s+/g;
+        const markers = [];
+        let match;
+        while ((match = markerRegex.exec(cleaned)) !== null) {
+          const rangeStart = match[1] ? parseInt(match[1], 10) : null;
+          const rangeEnd = match[2] ? parseInt(match[2], 10) : null;
+          const singleNum = match[3] ? parseInt(match[3], 10) : null;
+          const num = rangeStart || singleNum;
+          if (num >= 18 && num <= 45) {
+            markers.push({
+              num,
+              rangeEnd: rangeEnd && rangeEnd >= num && rangeEnd <= 45 ? rangeEnd : num,
+              index: match.index,
+              contentStart: match.index + match[0].length,
+            });
+          }
+        }
+
+        for (let i = 0; i < markers.length; i++) {
+          const cur = markers[i];
+          const next = markers[i + 1];
+          const sliceEnd = next ? next.index : cleaned.length;
+          let block = cleaned.slice(cur.contentStart, sliceEnd).trim();
+
+          // 한국어 발문(첫 줄)과 선택지/페이지 머리말 정리 후 순수 영어 본문 추출
+          const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+          const englishLines = [];
+          for (const line of lines) {
+            // 저작권/페이지 번호/영역 표시 제거
+            if (/^(고[123]|영어\s*영역|\d+\s*\/\s*\d+|이\s*문제지에\s*관한|확인\s*사항)/.test(line)) continue;
+            // 순수 한글 발문 줄은 건너뛰되, 영문 비율이 있는 줄은 보존
+            const engChars = (line.match(/[A-Za-z]/g) || []).length;
+            if (engChars >= 4) {
+              englishLines.push(line);
+            }
+          }
+
+          const passageText = englishLines.join(' ').replace(/\s{2,}/g, ' ').trim();
+          if (passageText.length >= 40) {
+            for (let n = cur.num; n <= cur.rangeEnd; n++) {
+              if (!map[n] || passageText.length > map[n].length) {
+                map[n] = passageText;
+              }
+            }
+          }
+        }
+
+        // 번호 구분 없이 영어 지문 덩어리만 있는 경우 fallback 키('_GENERAL_') 저장
+        const generalLines = cleaned
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => (l.match(/[A-Za-z]/g) || []).length >= 12);
+        if (generalLines.length > 0) {
+          map._GENERAL_ = generalLines.join(' ').replace(/\s{2,}/g, ' ').trim();
+        }
+
+        return map;
       }
 
       // 파일명/입력값에서 출제자 이름 추정
@@ -896,94 +1039,208 @@
       }
 
       // 시험진도 교재 사진 및 누적 경향을 바탕으로 변형문제 생성
-      function buildVariantQuestions(schoolName, term, authorScope, count, materialFiles, trend, customPrompt) {
+      function buildVariantQuestions(schoolName, term, authorScope, count, materialFiles, trend, customPrompt, manualFallbackText) {
         const cleanCustomPrompt = (customPrompt || '').trim();
+        const manualMap = parseMockExamPassagesByNumber(manualFallbackText || '');
 
         // 학교 기출 분석 비율(어법/어휘/독해추론/서술형)에 맞춰 자동 문항 유형 구성
         const weights = trend && trend.weights
           ? trend.weights
           : { grammar: 25, vocabulary: 25, inference: 25, descriptive: 25 };
 
+        // 실제 추출된 원문 영어 지문에서 핵심 단어를 뽑아 문항 유형별로 정확히 변형
+        function transformPassageForQuestion(rawPassage, category, qIdx) {
+          const cleanPassage = (rawPassage || '').replace(/\s+/g, ' ').trim();
+          if (!cleanPassage) return null;
+
+          // 문장 단위 분리
+          const sentences = cleanPassage
+            .split(/(?<=[.!?])\s+/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+          // 원문 내 영단어 추출 (선택지 구성용)
+          const words = (cleanPassage.match(/\b[A-Za-z]{4,}\b/g) || []).filter(
+            (w) => !/^(this|that|with|from|they|them|their|there|these|those|which|where|when|what|have|been|were|will|would|could|should|into|about|other|more|most|some|such|than|then|also|only|very|even|each|many|much)$/i.test(w)
+          );
+          const uniqueWords = Array.from(new Set(words));
+
+          if (category === 'grammar') {
+            // 원문 속 동사/분사/관계사/접속사 위치 5곳에 ①~⑤ 번호 부여
+            let markCount = 0;
+            const targetRegex = /\b([A-Za-z]+(?:ing|ed|s)|which|that|who|where|is|are|was|were|have|has|to\s+[a-z]{3,})\b/g;
+            const markedWords = [];
+            const circled = ['①', '②', '③', '④', '⑤'];
+            const markedPassage = cleanPassage.replace(targetRegex, (match) => {
+              if (markCount >= 5) return match;
+              const badge = circled[markCount];
+              markedWords.push(`${badge} ${match}`);
+              markCount += 1;
+              return `${badge} ${match}`;
+            });
+
+            if (markedWords.length >= 3) {
+              const wrongIdx = qIdx % markedWords.length;
+              return {
+                passage: markedPassage,
+                choices: markedWords.slice(0, 5),
+                answer: `${markedWords[wrongIdx]} (원문 문장 구조의 수일치·준동사·관계사 어법 변별 포인트)`,
+                explanation: `업로드된 원본 지문 전체를 그대로 유지하면서 핵심 어법 요소(${markedWords.join(', ')})를 추출해 변형한 문항입니다.`,
+              };
+            }
+          }
+
+          if (category === 'vocabulary' && uniqueWords.length >= 5) {
+            const circled = ['①', '②', '③', '④', '⑤'];
+            const step = Math.max(1, Math.floor(uniqueWords.length / 5));
+            const picked = [];
+            for (let k = 0; k < 5 && k * step < uniqueWords.length; k++) {
+              picked.push(uniqueWords[k * step]);
+            }
+            let markedPassage = cleanPassage;
+            const choices = [];
+            picked.forEach((word, idx) => {
+              const re = new RegExp(`\\b${word}\\b`);
+              markedPassage = markedPassage.replace(re, `${circled[idx]} ${word}`);
+              choices.push(`${circled[idx]} ${word}`);
+            });
+            const ansIdx = qIdx % choices.length;
+            return {
+              passage: markedPassage,
+              choices,
+              answer: `${choices[ansIdx]} (문맥상 반의어/유의어 치환 변별 포인트)`,
+              explanation: `업로드된 원본 지문 전체의 논리 흐름 속에서 핵심 어휘 5개(${picked.join(', ')})의 문맥적 적절성을 묻는 문항입니다.`,
+            };
+          }
+
+          if (category === 'inference' && sentences.length >= 3) {
+            // 원문의 핵심 문장 하나를 빈칸 처리하고 원본 문장을 정답 선지로 배치
+            const targetSentIdx = Math.min(sentences.length - 1, Math.max(1, Math.floor(sentences.length / 2)));
+            const targetSentence = sentences[targetSentIdx];
+            const blankedSentences = sentences.map((s, idx) =>
+              idx === targetSentIdx ? '________________________________________.' : s
+            );
+            const distractorSeeds = uniqueWords.slice(0, 4);
+            const rawChoices = [
+              targetSentence.replace(/[.!?]+$/, ''),
+              `ignoring the core evidence related to ${distractorSeeds[0] || 'the main issue'}`,
+              `repeating familiar habits without considering ${distractorSeeds[1] || 'new contexts'}`,
+              `relying on isolated details rather than ${distractorSeeds[2] || 'overall structure'}`,
+              `delaying decisions until ${distractorSeeds[3] || 'external conditions'} disappear`,
+            ];
+            const correctPos = qIdx % 5;
+            const ordered = [...rawChoices];
+            const temp = ordered[0];
+            ordered[0] = ordered[correctPos];
+            ordered[correctPos] = temp;
+            const circled = ['①', '②', '③', '④', '⑤'];
+            return {
+              passage: blankedSentences.join(' '),
+              choices: ordered.map((c, idx) => `${circled[idx]} ${c}`),
+              answer: `${circled[correctPos]} ${targetSentence.replace(/[.!?]+$/, '')}`,
+              explanation: `업로드된 원본 지문 전체의 핵심 결론·전개 문장을 빈칸으로 변형하여 문맥 추론 능력을 평가하는 문항입니다.`,
+            };
+          }
+
+          if (category === 'order' && sentences.length >= 4) {
+            // 원문 문장 중 하나를 [주어진 문장]으로 분리하고 원문 전체 흐름에 ①~⑤ 삽입 위치 배치
+            const extractIdx = Math.min(sentences.length - 2, Math.max(1, (qIdx % (sentences.length - 2)) + 1));
+            const givenSentence = sentences[extractIdx];
+            const remaining = sentences.filter((_, idx) => idx !== extractIdx);
+            const circled = ['①', '②', '③', '④', '⑤'];
+            const insertedText = remaining
+              .slice(0, 5)
+              .map((s, idx) => `( ${circled[idx]} ) ${s}`)
+              .join(' ') + (remaining.length > 5 ? ' ' + remaining.slice(5).join(' ') : '');
+            const correctPos = Math.min(4, extractIdx);
+            return {
+              passage: `[주어진 문장] ${givenSentence}\n\n${insertedText}`,
+              choices: circled,
+              answer: `${circled[correctPos]}`,
+              explanation: `업로드된 원본 지문 전체의 문장 간 연결어·지시어 흐름을 바탕으로 주어진 문장의 원래 위치를 찾는 문항입니다.`,
+            };
+          }
+
+          // 서술형: 원문 핵심 문장을 조건 영작/어순 배열 문제로 출제
+          const keySentence =
+            sentences[Math.min(sentences.length - 1, Math.max(0, qIdx % sentences.length))] || cleanPassage;
+          const cleanKey = keySentence.replace(/[.!?]+$/, '').trim();
+          const tokens = cleanKey.split(/\s+/);
+          const shuffled = [...tokens].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+          return {
+            passage: `[원본 변형 지문 전체]\n${cleanPassage}\n\n<보기> [ ${shuffled.join(' / ')} ]\n\n조건: 위 지문 맥락에 맞게 <보기>의 단어를 모두 배열하여 핵심 문장을 완성하시오. (필요시 어형 변화 가능)`,
+            choices: [
+              '※ 업로드된 원본 지문 전체의 핵심 문장을 활용한 서술형 문항입니다. 아래 정답·해설 보기를 눌러 원문 정답을 확인하세요.',
+            ],
+            answer: `${cleanKey}.`,
+            explanation: `업로드된 원본 지문의 핵심 문장을 기반으로 어순과 구문 정확도를 확인하는 서술형 변형 문항입니다.`,
+          };
+        }
+
         const templates = [
           {
             category: 'grammar',
             type: '어법 변형 (밑줄 친 부분 중 어법상 틀린 것)',
             stem: (srcLabel, originTag, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 다음은 업로드된 자료(${srcLabel})의 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 글입니다. 밑줄 친 부분 중 어법상 옳지 않은 것은?`,
-            passage:
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 다음은 업로드된 자료(${srcLabel})의 원문 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 글입니다. 밑줄 친 부분 중 어법상 옳지 않은 것은?`,
+            fallbackPassage:
               'Students who ① engage actively with complex English passages across school curricula often benefit from ② analyzing how clauses connect ideas rather than memorizing isolated sentences. When a writer ③ introduces a contrasting viewpoint in the middle of an argument, readers who ④ track transition cues and verb forms can identify subtle shifts in meaning more accurately, thereby ⑤ strengthening their overall reading competence.',
-            choices: [
-              '① engage',
-              '② analyzing',
-              '③ introduces',
-              '④ track',
-              '⑤ strengthening',
-            ],
-            answer: '③ introduces → introduce (주어가 복수형인 경우와의 수일치 및 동사 형태 변별 포인트 확인)',
-            explanation:
-              '학교 기출의 수일치·병렬 구조 변별 경향을 반영하여 원문 지문 전체를 재구성한 문항입니다.',
+            fallbackChoices: ['① engage', '② analyzing', '③ introduces', '④ track', '⑤ strengthening'],
+            fallbackAnswer: '③ introduces → introduce (복수 주어 Students와의 수일치 필요)',
+            fallbackExplanation: '학교 기출의 수일치·병렬 구조 변별 경향을 반영한 어법 변형 문항입니다.',
           },
           {
             category: 'vocabulary',
             type: '어휘 문맥 추론 (문맥상 낱말의 쓰임이 적절하지 않은 것)',
             stem: (srcLabel, originTag, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 업로드된 자료(${srcLabel})의 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 글입니다. 문맥상 낱말의 쓰임이 적절하지 않은 것은?`,
-            passage:
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 업로드된 자료(${srcLabel})의 원문 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 글입니다. 문맥상 낱말의 쓰임이 적절하지 않은 것은?`,
+            fallbackPassage:
               'Clear academic writing depends on ① precision rather than decorative length. When a paragraph piles up vague modifiers without concrete examples, its central claim inevitably becomes ② obscured for the audience. By contrast, effective revisions ③ clarify the logical bridge between supporting evidence and the final conclusion, enabling critical readers to ④ overlook key reasoning gaps instead of missing them. Ultimately, disciplined editing ⑤ elevates both the credibility and persuasiveness of any analytical essay.',
-            choices: [
-              '① precision',
-              '② obscured',
-              '③ clarify',
-              '④ overlook',
-              '⑤ elevates',
-            ],
-            answer: '④ overlook → spot / detect (논리적 허점을 간과하는 것이 아니라 찾아내도록 돕는다는 문맥 필요)',
-            explanation:
-              '학교 기출의 어휘·패러프레이징 비중을 반영해 원문 전체 흐름 속에서 핵심 어휘를 치환하여 출제했습니다.',
+            fallbackChoices: ['① precision', '② obscured', '③ clarify', '④ overlook', '⑤ elevates'],
+            fallbackAnswer: '④ overlook → spot / detect (논리적 허점을 간과하는 것이 아니라 찾아내도록 돕는다는 문맥 필요)',
+            fallbackExplanation: '학교 기출의 어휘·패러프레이징 비중을 반영한 문항입니다.',
           },
           {
             category: 'inference',
             type: '빈칸 추론 (빈칸에 들어갈 말로 가장 적절한 것)',
             stem: (srcLabel, originTag, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 문항입니다. 다음 글의 빈칸에 들어갈 말로 가장 적절한 것은?`,
-            passage:
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 원문 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 문항입니다. 다음 글의 빈칸에 들어갈 말로 가장 적절한 것은?`,
+            fallbackPassage:
               'Relying solely on familiar practice questions can create a false sense of mastery during exam preparation. While surface recognition feels comfortable, it rarely transfers when wording or sentence structure is altered. True comprehension is tested when learners must apply the same underlying principle to unfamiliar contexts, which fundamentally requires ____________________________. Once students develop that habit, even heavily paraphrased passages become manageable.',
-            choices: [
+            fallbackChoices: [
               '① copying model answers word for word without reflection',
               '② abstracting the core rule behind each illustrative example',
               '③ skipping unfamiliar vocabulary without checking context',
               '④ memorizing paragraph numbers in the original textbook',
               '⑤ delaying cumulative review until the night before the test',
             ],
-            answer: '② abstracting the core rule behind each illustrative example',
-            explanation:
-              '지문 전체의 도입-전개-결론 흐름상 낯선 맥락에 원리를 적용하려면 사례 이면의 핵심 규칙을 추상화·일반화해야 한다는 내용이 빈칸에 가장 적절합니다.',
+            fallbackAnswer: '② abstracting the core rule behind each illustrative example',
+            fallbackExplanation: '원문 지문 전체의 도입-전개-결론 흐름상 핵심 규칙의 추상화가 빈칸에 가장 적절합니다.',
           },
           {
-            category: 'inference',
+            category: 'order',
             type: '글의 순서·흐름 연결 (주어진 문장이 들어갈 위치)',
             stem: (srcLabel, originTag, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 문항입니다. 글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?`,
-            passage:
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 원문 지문 전체를 ${schoolName} 출제 경향에 맞게 변형한 문항입니다. 글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?`,
+            fallbackPassage:
               '[주어진 문장] However, rapid adoption without clear guidelines can unintentionally amplify misunderstandings across collaborative teams.\n\nNew digital platforms allow members to share drafts and exchange feedback in real time across locations. ( ① ) This immediacy speeds up early brainstorming and significantly reduces waiting time between revisions. ( ② ) When shared expectations around feedback tone and priorities are left unspoken, minor textual edits may easily be misread as personal criticism. ( ③ ) Establishing transparent norms at the outset turns fast digital collaboration into sustainable collective progress. ( ④ ) As a result, teams preserve both speed and mutual trust throughout long-term projects. ( ⑤ )',
-            choices: ['①', '②', '③', '④', '⑤'],
-            answer: '②',
-            explanation:
-              '변형된 지문 전체를 읽고 단절 지점을 찾는 문항입니다. ①~② 앞까지는 빠른 협업의 장점을 설명하고, ② 뒤부터는 명시적 기준 부재로 인한 오해를 다루므로 역접(However) 문장이 ②에 들어가는 것이 가장 자연스럽습니다.',
+            fallbackChoices: ['①', '②', '③', '④', '⑤'],
+            fallbackAnswer: '②',
+            fallbackExplanation: '변형된 지문 전체의 연결어·지시어 단절 지점을 찾는 문항입니다.',
           },
           {
             category: 'descriptive',
             type: '서술형 조건 영작 (보기의 단어를 활용해 문장 완성)',
             stem: (srcLabel, originTag, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 변형 지문 전체를 읽고, 밑줄 친 우리말 뜻에 맞게 <보기>의 단어를 모두 사용하여 문장을 완성하시오. (필요시 어형 변화 가능)`,
-            passage: `[변형 지문 전체]\nEffective learning does not come from passive repetition alone. When learners pause to evaluate why an answer works, they build transferable mental frameworks that hold up under exam pressure. In other words, (학생들이 자신의 학습 전략을 스스로 점검할수록, 그들은 복잡한 지문을 더 정확하게 이해하게 된다.) This metacognitive routine ultimately separates deep understanding from short-term memorization.\n\n<보기> [ the / reflect / their / study strategies / accurately / comprehend / complex passages / on / more / students / the / will ]\n\n조건: "The + 비교급 ~, the + 비교급 ..." 구문을 반드시 활용할 것.`,
-            choices: [
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 원문 변형 지문 전체를 읽고, 조건에 맞게 <보기>의 단어를 모두 사용하여 문장을 완성하시오. (필요시 어형 변화 가능)`,
+            fallbackPassage: `[변형 지문 전체]\nEffective learning does not come from passive repetition alone. When learners pause to evaluate why an answer works, they build transferable mental frameworks that hold up under exam pressure. In other words, (학생들이 자신의 학습 전략을 스스로 점검할수록, 그들은 복잡한 지문을 더 정확하게 이해하게 된다.) This metacognitive routine ultimately separates deep understanding from short-term memorization.\n\n<보기> [ the / reflect / their / study strategies / accurately / comprehend / complex passages / on / more / students / the / will ]\n\n조건: "The + 비교급 ~, the + 비교급 ..." 구문을 반드시 활용할 것.`,
+            fallbackChoices: [
               '※ 변형 지문 전체 맥락을 바탕으로 작성하는 서술형 문항입니다. 아래 정답·해설 보기를 눌러 모범 답안과 채점 기준을 확인하세요.',
             ],
-            answer:
+            fallbackAnswer:
               'The more students reflect on their study strategies, the more accurately they will comprehend complex passages.',
             explanation:
-              '학교 기출의 서술형 비중을 반영해 변형 지문 전체 맥락 속에서 핵심 구문(The + 비교급, the + 비교급)과 어순 배열을 완성하도록 출제한 문항입니다.',
+              '학교 기출의 서술형 비중을 반영한 문항입니다.',
           },
         ];
 
@@ -1011,34 +1268,76 @@
           const mockMeta = detectMockExamMeta(srcName);
           const isMockSource = Boolean((src && (src.isPdf || src.isMockExam)) || mockMeta.isMock);
 
-          // 학평 자료일 경우 18~45번 범위 또는 사용자 입력 범위(예: 18-45번)에서 원본 문항 번호 순차 산출
+          // 업로드된 파일에서 추출된 문항별 실제 지문 맵 + 수동 입력 보정 맵 병합
+          const fileExtractedMap = (src && src.extractedQuestionsMap) || {};
+          const extractedNums = Object.keys(fileExtractedMap)
+            .filter((k) => /^\d+$/.test(k))
+            .map((k) => parseInt(k, 10))
+            .sort((a, b) => a - b);
+
           let originalSourceBadge = '';
           let originalQuestionNumber = null;
+          let matchedRawPassage = '';
+
           if (isMockSource) {
-            const parsedNums = parseOriginalNumberList(src && src.originalNumbers);
-            originalQuestionNumber = parsedNums[Math.floor(i / materialFiles.length) % parsedNums.length];
+            const userRequestedNums = parseOriginalNumberList(src && src.originalNumbers);
+            // 사용자가 특정 번호를 입력했으면 그 번호를, 기본(18-45)이면서 실제 추출된 번호가 있으면 추출된 번호를 우선 매칭
+            const hasExplicitCustomNums =
+              (src && src.originalNumbers && src.originalNumbers.trim() !== '18-45');
+            const candidateNums =
+              !hasExplicitCustomNums && extractedNums.length > 0
+                ? extractedNums
+                : userRequestedNums;
+
+            originalQuestionNumber =
+              candidateNums[Math.floor(i / materialFiles.length) % candidateNums.length];
             originalSourceBadge = `${mockMeta.examLabel} ${originalQuestionNumber}번 원본 변형`;
+
+            // 해당 원본 문항 번호의 실제 추출 지문을 정확히 매칭
+            matchedRawPassage =
+              manualMap[originalQuestionNumber] ||
+              fileExtractedMap[originalQuestionNumber] ||
+              manualMap._GENERAL_ ||
+              fileExtractedMap._GENERAL_ ||
+              '';
+          } else {
+            matchedRawPassage =
+              manualMap._GENERAL_ ||
+              fileExtractedMap._GENERAL_ ||
+              '';
           }
+
+          const transformed = matchedRawPassage
+            ? transformPassageForQuestion(matchedRawPassage, tpl.category, i)
+            : null;
 
           const srcBadge = isMockSource ? `[학평 자료] ${srcName}` : srcName;
           const customNoteBlock = cleanCustomPrompt
             ? `\n\n[선생님 추가 요청사항] ${cleanCustomPrompt}`
             : '';
 
+          const finalPassage = transformed ? transformed.passage : tpl.fallbackPassage;
+          const finalChoices = transformed ? transformed.choices : tpl.fallbackChoices;
+          const finalAnswer = transformed ? transformed.answer : tpl.fallbackAnswer;
+          const finalExplanation = transformed
+            ? transformed.explanation
+            : (tpl.fallbackExplanation || tpl.explanation || '');
+
           questions.push({
             id: `vq_${Date.now()}_${i}`,
             type: `${i + 1}번 · ${tpl.type}`,
             sourceImage: srcBadge,
             isMockSource,
+            isExactMatched: Boolean(transformed),
             originalQuestionNumber,
             originalSourceBadge,
             customPrompt: cleanCustomPrompt,
             trendBasis,
             stem: tpl.stem(srcBadge, originalSourceBadge, i),
-            passage: `${tpl.passage}${customNoteBlock}`,
-            choices: tpl.choices,
-            answer: tpl.answer,
-            explanation: `${tpl.explanation}${
+            passage: `${finalPassage}${customNoteBlock}`,
+            choices: finalChoices,
+            answer: finalAnswer,
+            explanation: `${finalExplanation}${
               cleanCustomPrompt ? ` [추가 반영: ${cleanCustomPrompt}]` : ''
             }${originalSourceBadge ? ` [출제 근거: ${originalSourceBadge}]` : ''}`,
           });
@@ -1639,6 +1938,8 @@
         const files = isExam ? state.pendingExamFiles : state.pendingMaterialFiles;
         const container = document.getElementById(isExam ? 'pendingExamQueue' : 'pendingMaterialQueue');
         const actionBtn = document.getElementById(isExam ? 'runExamAnalysisBtn' : 'generateVariantsBtn');
+        const fallbackBox = document.getElementById('manualPassageFallbackBox');
+        const extractedSummary = document.getElementById('extractedPassageSummary');
 
         if (!container || !actionBtn) return;
 
@@ -1646,14 +1947,55 @@
           container.classList.add('hidden');
           container.innerHTML = '';
           actionBtn.disabled = true;
+          if (!isExam && fallbackBox) fallbackBox.classList.add('hidden');
           return;
         }
 
         actionBtn.disabled = false;
         container.classList.remove('hidden');
+
+        if (!isExam && fallbackBox) {
+          fallbackBox.classList.remove('hidden');
+          const allMatchedNums = new Set();
+          let hasGeneralText = false;
+          files.forEach((f) => {
+            const map = f.extractedQuestionsMap || {};
+            Object.keys(map).forEach((k) => {
+              if (/^\d+$/.test(k)) allMatchedNums.add(parseInt(k, 10));
+              if (k === '_GENERAL_') hasGeneralText = true;
+            });
+          });
+          if (extractedSummary) {
+            if (allMatchedNums.size > 0) {
+              const sorted = Array.from(allMatchedNums).sort((a, b) => a - b);
+              extractedSummary.textContent = `자동 인식된 원본 번호: ${sorted.join(', ')}번 지문 추출 완료`;
+              extractedSummary.className = 'text-[11px] font-semibold text-emerald-300';
+            } else if (hasGeneralText) {
+              extractedSummary.textContent = '영어 본문 텍스트 추출 완료 (번호 구분 필요 시 아래 입력 가능)';
+              extractedSummary.className = 'text-[11px] font-semibold text-sky-300';
+            } else {
+              extractedSummary.textContent = '스캔 이미지 PDF인 경우 아래에 원본 번호와 지문을 붙여넣으세요';
+              extractedSummary.className = 'text-[11px] font-semibold text-amber-300';
+            }
+          }
+        }
+
         container.innerHTML = files
           .map((item) => {
             const isMock = !isExam && (item.isPdf || item.isMockExam);
+            const extractedNums = Object.keys(item.extractedQuestionsMap || {})
+              .filter((k) => /^\d+$/.test(k))
+              .map((k) => parseInt(k, 10))
+              .sort((a, b) => a - b);
+            const statusText =
+              item.extractionStatus === 'extracting'
+                ? '원문 지문 추출 중...'
+                : extractedNums.length > 0
+                ? `추출 완료: ${extractedNums.join(', ')}번 지문 매핑됨`
+                : item.extractedQuestionsMap && item.extractedQuestionsMap._GENERAL_
+                ? '영어 본문 추출 완료'
+                : '이미지/스캔본 (하단 지문 보정 가능)';
+
             return `
           <div class="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2.5 space-y-2">
             <div class="flex items-center justify-between gap-3">
@@ -1668,7 +2010,7 @@
                     ${isMock ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold shrink-0">학평 자료</span>' : ''}
                     <p class="text-xs font-medium text-slate-200 truncate">${escapeHtml(item.name)}</p>
                   </div>
-                  <p class="text-[11px] text-slate-500">${Math.max(1, Math.round(item.size / 1024))} KB</p>
+                  <p class="text-[11px] text-slate-400">${Math.max(1, Math.round(item.size / 1024))} KB${!isExam ? ` · <span class="text-sky-300">${statusText}</span>` : ''}</p>
                 </div>
               </div>
               <div class="flex items-center gap-2 shrink-0">
@@ -1697,7 +2039,7 @@
                       type="text"
                       data-origin-num-id="${item.id}"
                       value="${escapeHtml(item.originalNumbers || '18-45')}"
-                      placeholder="예: 18-45 또는 18-45번 (자동으로 18번~45번 인식)"
+                      placeholder="예: 18-45 또는 29, 31-34 (해당 번호의 원본 지문과 정확히 매칭)"
                       class="origin-num-input flex-1 rounded-lg bg-slate-900 border border-slate-700 px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-400"
                     />
                   </div>`
@@ -1774,16 +2116,19 @@
           const isMockExam = isMaterial && (isPdf || mockMeta.isMock);
           try {
             const dataUrl = isPdf ? null : await readFileAsDataUrl(f);
-            loaded.push({
+            const itemObj = {
               id: `${queueType}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
               file: f,
               dataUrl,
               isPdf,
               isMockExam,
               originalNumbers: isMockExam ? mockMeta.detectedRangeText : '',
+              extractedQuestionsMap: {},
+              extractionStatus: isMaterial ? 'extracting' : 'done',
               name: f.name,
               size: f.size,
-            });
+            };
+            loaded.push(itemObj);
           } catch (err) {
             showToast(`"${f.name}" 파일을 불러오는 중 오류가 발생했습니다.`, 'warn');
           }
@@ -1796,12 +2141,40 @@
         } else {
           state.pendingMaterialFiles = [...state.pendingMaterialFiles, ...loaded];
           renderPendingQueue('material');
-          const mockCount = loaded.filter((x) => x.isMockExam).length;
-          const msg =
-            mockCount > 0
-              ? `진도 자료 ${loaded.length}건(학평 자료 ${mockCount}건 포함 · 원본 번호 지정 가능)이 준비되었습니다.`
-              : `시험진도 교재 사진 ${loaded.length}장이 준비되었습니다.`;
-          showToast(msg, 'info');
+          showToast(`자료를 불러왔습니다. 원본 문항 번호별 영어 지문을 자동 추출하는 중입니다...`, 'info');
+
+          // 비동기로 PDF 텍스트 및 이미지 OCR 추출 후 문항 번호별 지문 맵 갱신
+          for (const item of loaded) {
+            const rawText = item.isPdf
+              ? await extractTextFromPdfFile(item.file)
+              : await extractTextFromImageDataUrl(item.dataUrl);
+            const qMap = parseMockExamPassagesByNumber(rawText);
+            item.extractedQuestionsMap = qMap;
+            item.extractionStatus = 'done';
+
+            const detectedNums = Object.keys(qMap)
+              .filter((k) => /^\d+$/.test(k))
+              .map((k) => parseInt(k, 10))
+              .sort((a, b) => a - b);
+
+            if (item.isMockExam && detectedNums.length > 0 && item.originalNumbers === '18-45') {
+              item.originalNumbers =
+                detectedNums.length === 1
+                  ? String(detectedNums[0])
+                  : `${detectedNums[0]}-${detectedNums[detectedNums.length - 1]}`;
+            }
+            renderPendingQueue('material');
+          }
+
+          const totalMapped = loaded.reduce(
+            (acc, it) => acc + Object.keys(it.extractedQuestionsMap || {}).filter((k) => /^\d+$/.test(k)).length,
+            0
+          );
+          if (totalMapped > 0) {
+            showToast(`학평 시험지에서 총 ${totalMapped}개 문항의 원본 지문 추출이 완료되었습니다.`, 'success');
+          } else {
+            showToast(`자료 준비 완료! 스캔본 PDF인 경우 아래 지문 보정란에 원문을 붙여넣으면 100% 일치 출제됩니다.`, 'info');
+          }
         }
       }
 
@@ -2101,6 +2474,7 @@
           const term = document.getElementById('targetExamTermSelect')?.value || '1학기 중간고사';
           const authorScope = document.getElementById('focusAuthorSelect')?.value || '__ALL__';
           const customPrompt = document.getElementById('customPromptInput')?.value || '';
+          const manualFallbackText = document.getElementById('manualPassageInput')?.value || '';
           const countInput = document.getElementById('variantCountSelect');
           const rawCount = parseInt(countInput?.value || '5', 10);
           const count = Number.isNaN(rawCount) ? 5 : Math.min(100, Math.max(1, rawCount));
@@ -2125,7 +2499,8 @@
             count,
             state.pendingMaterialFiles,
             trend,
-            customPrompt
+            customPrompt,
+            manualFallbackText
           );
 
           schoolData.generatedSets.push(generatedSet);
