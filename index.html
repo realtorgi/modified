@@ -381,6 +381,28 @@
               </div>
             </div>
 
+            <!-- 개인 맞춤 출제 요청사항 입력 -->
+            <div>
+              <div class="flex items-center justify-between gap-2 mb-1.5">
+                <label for="customPromptInput" class="block text-xs font-semibold text-slate-300">
+                  개인 맞춤 출제 요청사항 (선택 · 직접 입력)
+                </label>
+                <span class="text-[11px] text-sky-400">생성 문항·조건에 즉시 반영</span>
+              </div>
+              <textarea
+                id="customPromptInput"
+                rows="3"
+                placeholder="예: 관계대명사·분사구문 어법 함정을 집중 출제해 주세요 / 서술형은 조건 영작 위주로 구성 / 킬러 문항 난이도 상향 등 원하는 내용을 자유롭게 적어주세요."
+                class="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-xs sm:text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 leading-relaxed"
+              ></textarea>
+              <div class="flex items-center gap-1.5 flex-wrap mt-2">
+                <button type="button" data-custom-tag="어법(분사구문·관계사·수일치) 집중 변별" class="custom-tag-btn px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-[11px] font-medium text-slate-300 border border-slate-700 transition cursor-pointer">+ 어법 집중 변별</button>
+                <button type="button" data-custom-tag="동의어·반의어 패러프레이징 강화" class="custom-tag-btn px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-[11px] font-medium text-slate-300 border border-slate-700 transition cursor-pointer">+ 패러프레이징 강화</button>
+                <button type="button" data-custom-tag="서술형 조건 영작·어형 변화 비중 확대" class="custom-tag-btn px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-[11px] font-medium text-slate-300 border border-slate-700 transition cursor-pointer">+ 서술형 조건 영작</button>
+                <button type="button" data-custom-tag="상위권 변별용 고난도 킬러 선지 구성" class="custom-tag-btn px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-[11px] font-medium text-sky-300 border border-slate-700 transition cursor-pointer">+ 고난도 킬러 변별</button>
+              </div>
+            </div>
+
             <div
               id="materialDropzone"
               tabindex="0"
@@ -491,7 +513,7 @@
         activeTab: 'analyze', // 'analyze' | 'generate'
         authorFilter: '__ALL__',
         pendingExamFiles: [], // { id, file, dataUrl, name, size }
-        pendingMaterialFiles: [], // { id, file, dataUrl, name, size }
+        pendingMaterialFiles: [], // { id, file, dataUrl, isPdf, name, size, originalNumbers }
         showAnswers: false,
         latestGeneratedSet: null,
         schools: {
@@ -691,7 +713,7 @@
             highlights: [
               '지문 흐름 단절(문장 넣기·글의 순서)과 핵심 주장 빈칸 추론 비중이 높게 구성됩니다.',
               '지시어(this, such, those 등)와 연결어(however, therefore 등)를 활용한 논리 전개 파악이 중요합니다.',
-              '서술형에서는 본문 핵심 어구를 발췌해 어법에 맞게 고쳐 쓰는 유형이 자주 등장합니다.',
+              '서술형에서는 본문 핵심 어구를 발췌해 어법에 맞게 고쳐 쓰는 유형이 자주 등장됩니다.',
             ],
             questionPlan: ['글의 순서·문장 삽입', '빈칸 추론', '내용 일치·불일치', '본문 발췌·어형 변형 서술형'],
           },
@@ -785,13 +807,67 @@
         };
       }
 
+      // 학력평가 여부 판별 및 원본 문항 번호 목록 추출/정리
+      const DEFAULT_MOCK_EXAM_NUMBERS = [18, 19, 20, 21, 22, 23, 24, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41];
+
+      function detectMockExamMeta(fileName) {
+        const lower = (fileName || '').toLowerCase();
+        const isMock = /학평|학력평가|모의고사|모평|전국연합|3월|6월|9월|10월|11월|mock/.test(lower);
+        const yearMatch = (fileName || '').match(/(20\d{2})/);
+        const monthMatch = (fileName || '').match(/(3|6|9|10|11)\s*월/);
+        const gradeMatch = (fileName || '').match(/고\s*([123])/);
+        const numMatch = (fileName || '').match(/(?:^|[_\-\s])(\d{1,2})\s*번?/);
+
+        const parts = [];
+        if (yearMatch) parts.push(`${yearMatch[1]}년`);
+        if (monthMatch) parts.push(`${monthMatch[1]}월`);
+        if (gradeMatch) parts.push(`고${gradeMatch[1]}`);
+        parts.push('학평');
+
+        return {
+          isMock,
+          examLabel: parts.join(' '),
+          explicitNum: numMatch ? parseInt(numMatch[1], 10) : null,
+        };
+      }
+
+      function parseOriginalNumberList(rawInput) {
+        const text = (rawInput || '').trim();
+        if (!text) return [];
+        const nums = [];
+        const tokens = text.split(/[,，\s/]+/).filter(Boolean);
+        for (const token of tokens) {
+          const rangeMatch = token.match(/^(\d{1,2})\s*[-~]\s*(\d{1,2})$/);
+          if (rangeMatch) {
+            const start = Math.min(45, Math.max(1, parseInt(rangeMatch[1], 10)));
+            const end = Math.min(45, Math.max(1, parseInt(rangeMatch[2], 10)));
+            const step = start <= end ? 1 : -1;
+            for (let n = start; step > 0 ? n <= end : n >= end; n += step) {
+              if (!nums.includes(n)) nums.push(n);
+            }
+          } else {
+            const singleMatch = token.match(/(\d{1,2})/);
+            if (singleMatch) {
+              const val = Math.min(45, Math.max(1, parseInt(singleMatch[1], 10)));
+              if (!nums.includes(val)) nums.push(val);
+            }
+          }
+        }
+        return nums;
+      }
+
       // 시험진도 교재 사진 및 누적 경향을 바탕으로 변형문제 생성
-      function buildVariantQuestions(schoolName, term, authorScope, count, materialFiles, trend) {
+      function buildVariantQuestions(schoolName, term, authorScope, count, materialFiles, trend, customPrompt) {
+        const cleanCustomPrompt = (customPrompt || '').trim();
+        const customDirectiveLine = cleanCustomPrompt
+          ? ` ※ [선생님 맞춤 출제 조건 반영: ${cleanCustomPrompt}]`
+          : '';
+
         const templates = [
           {
             type: '어법 변형 (밑줄 친 부분 중 어법상 틀린 것)',
-            stem: (srcName, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}] 다음은 업로드된 시험진도 교재(${srcName})의 핵심 구문을 변형한 지문입니다. 밑줄 친 부분 중 어법상 옳지 않은 것은?`,
+            stem: (srcLabel, originTag, idx) =>
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 다음은 업로드된 자료(${srcLabel})의 핵심 구문을 변형한 지문입니다. 밑줄 친 부분 중 어법상 옳지 않은 것은?${customDirectiveLine}`,
             passage:
               'Students who engage actively with complex English passages often benefit from analyzing how clauses connect ideas rather than memorizing isolated sentences. When a writer introduces a contrasting viewpoint, readers who track transition cues and verb forms can identify subtle shifts in meaning more accurately.',
             choices: [
@@ -807,8 +883,8 @@
           },
           {
             type: '어휘 문맥 추론 (문맥상 낱말의 쓰임이 적절하지 않은 것)',
-            stem: (srcName, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}] 업로드된 진도 교재(${srcName}) 내용을 바탕으로 재구성한 글입니다. 문맥상 낱말의 쓰임이 적절하지 않은 것은?`,
+            stem: (srcLabel, originTag, idx) =>
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 업로드된 자료(${srcLabel}) 내용을 바탕으로 재구성한 글입니다. 문맥상 낱말의 쓰임이 적절하지 않은 것은?${customDirectiveLine}`,
             passage:
               'Clear academic writing depends on precision rather than decorative length. If a paragraph piles up vague modifiers, the central claim becomes ① obscured. Effective revisions ② clarify the relationship between evidence and conclusion, helping readers ③ overlook key logical gaps instead of missing them.',
             choices: [
@@ -824,8 +900,8 @@
           },
           {
             type: '빈칸 추론 (빈칸에 들어갈 말로 가장 적절한 것)',
-            stem: (srcName, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}] 진도 교재(${srcName})의 핵심 논지를 변형한 문항입니다. 빈칸에 들어갈 말로 가장 적절한 것은?`,
+            stem: (srcLabel, originTag, idx) =>
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel})의 핵심 논지를 변형한 문항입니다. 빈칸에 들어갈 말로 가장 적절한 것은?${customDirectiveLine}`,
             passage:
               'Relying solely on familiar examples can create a false sense of mastery during exam preparation. True comprehension is tested when learners apply the same underlying principle to unfamiliar contexts, which requires ____________________________.',
             choices: [
@@ -841,8 +917,8 @@
           },
           {
             type: '글의 순서·흐름 연결 (주어진 문장이 들어갈 위치)',
-            stem: (srcName, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}] 시험진도 교재(${srcName}) 지문을 변형한 문항입니다. 주어진 문장이 들어가기에 가장 적절한 곳은?`,
+            stem: (srcLabel, originTag, idx) =>
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 지문을 변형한 문항입니다. 주어진 문장이 들어가기에 가장 적절한 곳은?${customDirectiveLine}`,
             passage:
               '[주어진 문장] However, rapid adoption without clear guidelines can amplify misunderstandings across teams.\n\nNew digital tools allow members to share drafts and feedback in real time. ( ① ) This immediacy speeds up early brainstorming and reduces waiting time. ( ② ) When expectations around revision tone are left unspoken, minor edits may be read as criticism. ( ③ ) Establishing shared norms early turns fast collaboration into sustainable progress. ( ④ )',
             choices: ['①', '②', '③', '④', '⑤ 주어진 문장이 필요 없음'],
@@ -852,8 +928,8 @@
           },
           {
             type: '서술형 조건 영작 (보기의 단어를 활용해 문장 완성)',
-            stem: (srcName, idx) =>
-              `[${schoolName} · ${term} 대비 #${idx + 1}] 진도 교재(${srcName}) 핵심 표현을 활용한 서술형 변형문항입니다. 우리말 뜻에 맞게 <보기>의 단어를 모두 사용하여 문장을 완성하시오. (필요시 어형 변화 가능)`,
+            stem: (srcLabel, originTag, idx) =>
+              `[${schoolName} · ${term} 대비 #${idx + 1}]${originTag ? ` (${originTag})` : ''} 자료(${srcLabel}) 핵심 표현을 활용한 서술형 변형문항입니다. 우리말 뜻에 맞게 <보기>의 단어를 모두 사용하여 문장을 완성하시오. (필요시 어형 변화 가능)${customDirectiveLine}`,
             passage:
               '우리말: 학생들이 자신의 학습 전략을 스스로 점검할수록, 그들은 복잡한 지문을 더 정확하게 이해하게 된다.\n\n<보기> [ the / reflect / their / study strategies / accurately / comprehend / complex passages / on / more / students / the / will ]\n\n조건: "The + 비교급 ~, the + 비교급 ..." 구문을 반드시 활용할 것.',
             choices: [
@@ -875,18 +951,45 @@
           const tpl = templates[i % templates.length];
           const src = materialFiles[i % materialFiles.length];
           const srcName = src ? src.name : '진도 교재 자료';
-          const srcBadge = src && src.isPdf ? `[학력평가 PDF] ${srcName}` : srcName;
+          const mockMeta = detectMockExamMeta(srcName);
+          const isMockSource = Boolean((src && (src.isPdf || src.isMockExam)) || mockMeta.isMock);
+
+          // 학평 자료일 경우 원본 문항 번호 산출 (사용자 입력 번호 목록 우선, 없으면 파일명/표준 학평 독해 문항 번호 매핑)
+          let originalSourceBadge = '';
+          let originalQuestionNumber = null;
+          if (isMockSource) {
+            const parsedNums = parseOriginalNumberList(src && src.originalNumbers);
+            if (parsedNums.length > 0) {
+              originalQuestionNumber = parsedNums[Math.floor(i / materialFiles.length) % parsedNums.length];
+            } else if (mockMeta.explicitNum) {
+              originalQuestionNumber = mockMeta.explicitNum;
+            } else {
+              originalQuestionNumber = DEFAULT_MOCK_EXAM_NUMBERS[i % DEFAULT_MOCK_EXAM_NUMBERS.length];
+            }
+            originalSourceBadge = `${mockMeta.examLabel} ${originalQuestionNumber}번 원본 변형`;
+          }
+
+          const srcBadge = isMockSource ? `[학평 자료] ${srcName}` : srcName;
+          const customNoteForExp = cleanCustomPrompt
+            ? ` (선생님 맞춤 요청사항 "${cleanCustomPrompt}" 반영)`
+            : '';
 
           questions.push({
             id: `vq_${Date.now()}_${i}`,
             type: `${i + 1}번 · ${tpl.type}`,
             sourceImage: srcBadge,
+            isMockSource,
+            originalQuestionNumber,
+            originalSourceBadge,
+            customPrompt: cleanCustomPrompt,
             trendBasis,
-            stem: tpl.stem(srcBadge, i),
+            stem: tpl.stem(srcBadge, originalSourceBadge, i),
             passage: tpl.passage,
             choices: tpl.choices,
             answer: tpl.answer,
-            explanation: tpl.explanation,
+            explanation: `${tpl.explanation}${customNoteForExp}${
+              originalSourceBadge ? ` [출제 근거: ${originalSourceBadge}]` : ''
+            }`,
           });
         }
 
@@ -895,8 +998,17 @@
           schoolName,
           term,
           authorScope,
+          customPrompt: cleanCustomPrompt,
           createdAt: new Date().toLocaleString('ko-KR'),
-          materialNames: materialFiles.map((f) => (f.isPdf ? `[학력평가 PDF] ${f.name}` : f.name)),
+          materialNames: materialFiles.map((f) => {
+            const mockMeta = detectMockExamMeta(f.name);
+            const isMock = f.isPdf || f.isMockExam || mockMeta.isMock;
+            if (!isMock) return f.name;
+            const numInfo = (f.originalNumbers || '').trim()
+              ? ` · 원본문항 ${f.originalNumbers.trim()}번`
+              : '';
+            return `[학평] ${f.name}${numInfo}`;
+          }),
           questions,
         };
       }
@@ -1391,7 +1503,8 @@
           titleEl.textContent = `${set.schoolName} · ${set.term} 영어 변형문제 (${set.questions.length}문항)`;
         }
         if (subtitleEl) {
-          subtitleEl.textContent = `반영 경향: ${set.authorScope === '__ALL__' ? '학교 전체 누적 경향' : set.authorScope} · 진도 자료 ${set.materialNames.length}건 기반`;
+          const customSummary = set.customPrompt ? ` · 맞춤조건: "${set.customPrompt}"` : '';
+          subtitleEl.textContent = `반영 경향: ${set.authorScope === '__ALL__' ? '학교 전체 누적 경향' : set.authorScope} · 진도 자료 ${set.materialNames.length}건 기반${customSummary}`;
         }
         if (toggleAnsBtn) {
           toggleAnsBtn.classList.remove('hidden');
@@ -1404,14 +1517,34 @@
           pdfBtn.classList.remove('hidden');
         }
 
-        container.innerHTML = set.questions
-          .map(
-            (q) => `
+        const customBannerHtml = set.customPrompt
+          ? `
+            <div class="rounded-xl bg-sky-500/10 border border-sky-500/30 px-4 py-3 text-xs text-sky-200 flex items-start gap-2">
+              <span class="font-bold text-sky-300 shrink-0">[선생님 맞춤 출제 조건]</span>
+              <span>${escapeHtml(set.customPrompt)}</span>
+            </div>
+          `
+          : '';
+
+        container.innerHTML =
+          customBannerHtml +
+          set.questions
+            .map(
+              (q) => `
           <article class="rounded-2xl bg-slate-950/80 border border-slate-800 p-4 sm:p-5 space-y-3">
             <div class="flex items-center justify-between gap-2 flex-wrap">
-              <span class="text-xs font-bold px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                ${escapeHtml(q.type)}
-              </span>
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-xs font-bold px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                  ${escapeHtml(q.type)}
+                </span>
+                ${
+                  q.originalSourceBadge
+                    ? `<span class="text-xs font-bold px-2.5 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-400/40">
+                        원본문항: ${escapeHtml(q.originalSourceBadge)}
+                      </span>`
+                    : ''
+                }
+              </div>
               <span class="text-[11px] text-slate-400">
                 교재: ${escapeHtml(q.sourceImage)} · 경향: ${escapeHtml(q.trendBasis)}
               </span>
@@ -1445,8 +1578,8 @@
             }
           </article>
         `
-          )
-          .join('');
+            )
+            .join('');
       }
 
       // 대기 파일 큐 렌더링
@@ -1468,34 +1601,82 @@
         actionBtn.disabled = false;
         container.classList.remove('hidden');
         container.innerHTML = files
-          .map(
-            (item) => `
-          <div class="flex items-center justify-between gap-3 rounded-xl bg-slate-950 border border-slate-800 px-3 py-2">
-            <div class="flex items-center gap-2.5 min-w-0">
-              ${
-                item.isPdf
-                  ? `<div class="w-10 h-10 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 flex items-center justify-center text-[11px] font-bold shrink-0">PDF</div>`
-                  : `<img src="${item.dataUrl}" alt="${escapeHtml(item.name)}" class="w-10 h-10 rounded-lg object-cover border border-slate-700 shrink-0" />`
-              }
-              <div class="min-w-0">
-                <div class="flex items-center gap-1.5">
-                  ${item.isPdf ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-semibold shrink-0">학력평가 PDF</span>' : ''}
-                  <p class="text-xs font-medium text-slate-200 truncate">${escapeHtml(item.name)}</p>
+          .map((item) => {
+            const isMock = !isExam && (item.isPdf || item.isMockExam);
+            return `
+          <div class="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2.5 space-y-2">
+            <div class="flex items-center justify-between gap-3">
+              <div class="flex items-center gap-2.5 min-w-0">
+                ${
+                  item.isPdf
+                    ? `<div class="w-10 h-10 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 flex items-center justify-center text-[11px] font-bold shrink-0">PDF</div>`
+                    : `<img src="${item.dataUrl}" alt="${escapeHtml(item.name)}" class="w-10 h-10 rounded-lg object-cover border border-slate-700 shrink-0" />`
+                }
+                <div class="min-w-0">
+                  <div class="flex items-center gap-1.5 flex-wrap">
+                    ${isMock ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold shrink-0">학평 자료</span>' : ''}
+                    <p class="text-xs font-medium text-slate-200 truncate">${escapeHtml(item.name)}</p>
+                  </div>
+                  <p class="text-[11px] text-slate-500">${Math.max(1, Math.round(item.size / 1024))} KB</p>
                 </div>
-                <p class="text-[11px] text-slate-500">${Math.max(1, Math.round(item.size / 1024))} KB</p>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                ${
+                  !isExam
+                    ? `<label class="inline-flex items-center gap-1 text-[11px] text-slate-300 cursor-pointer select-none">
+                        <input type="checkbox" data-toggle-mock-id="${item.id}" class="toggle-mock-checkbox rounded border-slate-600 bg-slate-900 text-amber-400" ${isMock ? 'checked' : ''} />
+                        <span>학평</span>
+                      </label>`
+                    : ''
+                }
+                <button
+                  type="button"
+                  data-remove-id="${item.id}"
+                  class="remove-pending-btn text-xs text-slate-400 hover:text-rose-300 px-2 py-1 rounded cursor-pointer"
+                >
+                  제거
+                </button>
               </div>
             </div>
-            <button
-              type="button"
-              data-remove-id="${item.id}"
-              class="remove-pending-btn text-xs text-slate-400 hover:text-rose-300 px-2 py-1 rounded cursor-pointer"
-            >
-              제거
-            </button>
+            ${
+              isMock
+                ? `<div class="pt-1.5 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center gap-1.5">
+                    <label class="text-[11px] font-semibold text-amber-300 shrink-0">학평 원본 번호:</label>
+                    <input
+                      type="text"
+                      data-origin-num-id="${item.id}"
+                      value="${escapeHtml(item.originalNumbers || '')}"
+                      placeholder="예: 29, 31-34, 37 (미입력 시 파일명/표준 번호 자동 매칭)"
+                      class="origin-num-input flex-1 rounded-lg bg-slate-900 border border-slate-700 px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-400"
+                    />
+                  </div>`
+                : ''
+            }
           </div>
-        `
-          )
+        `;
+          })
           .join('');
+
+        container.querySelectorAll('.toggle-mock-checkbox').forEach((chk) => {
+          chk.addEventListener('change', () => {
+            const targetId = chk.getAttribute('data-toggle-mock-id');
+            const targetItem = state.pendingMaterialFiles.find((f) => f.id === targetId);
+            if (targetItem) {
+              targetItem.isMockExam = chk.checked;
+              renderPendingQueue('material');
+            }
+          });
+        });
+
+        container.querySelectorAll('.origin-num-input').forEach((inp) => {
+          inp.addEventListener('input', () => {
+            const targetId = inp.getAttribute('data-origin-num-id');
+            const targetItem = state.pendingMaterialFiles.find((f) => f.id === targetId);
+            if (targetItem) {
+              targetItem.originalNumbers = inp.value;
+            }
+          });
+        });
 
         container.querySelectorAll('.remove-pending-btn').forEach((btn) => {
           btn.addEventListener('click', () => {
@@ -1538,6 +1719,8 @@
         const loaded = [];
         for (const f of validFiles) {
           const isPdf = f.type === 'application/pdf' || (f.name && f.name.toLowerCase().endsWith('.pdf'));
+          const mockMeta = detectMockExamMeta(f.name);
+          const isMockExam = isMaterial && (isPdf || mockMeta.isMock);
           try {
             const dataUrl = isPdf ? null : await readFileAsDataUrl(f);
             loaded.push({
@@ -1545,6 +1728,8 @@
               file: f,
               dataUrl,
               isPdf,
+              isMockExam,
+              originalNumbers: mockMeta.explicitNum ? String(mockMeta.explicitNum) : '',
               name: f.name,
               size: f.size,
             });
@@ -1560,10 +1745,10 @@
         } else {
           state.pendingMaterialFiles = [...state.pendingMaterialFiles, ...loaded];
           renderPendingQueue('material');
-          const pdfCount = loaded.filter((x) => x.isPdf).length;
+          const mockCount = loaded.filter((x) => x.isMockExam).length;
           const msg =
-            pdfCount > 0
-              ? `진도 자료 ${loaded.length}건(학력평가 PDF ${pdfCount}건 포함)이 준비되었습니다.`
+            mockCount > 0
+              ? `진도 자료 ${loaded.length}건(학평 자료 ${mockCount}건 포함 · 원본 번호 지정 가능)이 준비되었습니다.`
               : `시험진도 교재 사진 ${loaded.length}장이 준비되었습니다.`;
           showToast(msg, 'info');
         }
@@ -1638,11 +1823,16 @@
         }
 
         const scopeLabel = set.authorScope === '__ALL__' ? '학교 전체 누적 경향' : set.authorScope;
+        const customPromptHtml = set.customPrompt
+          ? `<p style="margin-top:4px;color:#0369a1;font-weight:700;">맞춤 출제 조건: ${escapeHtml(set.customPrompt)}</p>`
+          : '';
         const questionsHtml = set.questions
           .map(
             (q) => `
           <section class="q-card">
-            <div class="q-meta">${escapeHtml(q.type)} · 교재: ${escapeHtml(q.sourceImage)}</div>
+            <div class="q-meta">${escapeHtml(q.type)}${
+              q.originalSourceBadge ? ` · [${escapeHtml(q.originalSourceBadge)}]` : ''
+            } · 교재: ${escapeHtml(q.sourceImage)}</div>
             <div class="q-stem">${escapeHtml(q.stem)}</div>
             <div class="q-passage">${escapeHtml(q.passage)}</div>
             <ul class="q-choices">
@@ -1738,6 +1928,7 @@
   <div class="header">
     <h1>${escapeHtml(set.schoolName)} · ${escapeHtml(set.term)} 영어 변형문제 (${set.questions.length}문항)</h1>
     <p>반영 경향: ${escapeHtml(scopeLabel)} · 진도 교재: ${escapeHtml((set.materialNames || []).join(', '))}</p>
+    ${customPromptHtml}
   </div>
   ${questionsHtml}
   <script>
@@ -1794,6 +1985,22 @@
             if (inputEl) {
               inputEl.value = String(clamped);
             }
+          });
+        });
+
+        // 개인 맞춤 출제 요청사항 빠른 태그 버튼
+        document.querySelectorAll('.custom-tag-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const tagText = (btn.getAttribute('data-custom-tag') || '').trim();
+            const textarea = document.getElementById('customPromptInput');
+            if (!textarea || !tagText) return;
+            const current = textarea.value.trim();
+            if (!current) {
+              textarea.value = tagText;
+            } else if (!current.includes(tagText)) {
+              textarea.value = `${current} / ${tagText}`;
+            }
+            textarea.focus();
           });
         });
 
@@ -1858,6 +2065,7 @@
 
           const term = document.getElementById('targetExamTermSelect')?.value || '1학기 중간고사';
           const authorScope = document.getElementById('focusAuthorSelect')?.value || '__ALL__';
+          const customPrompt = document.getElementById('customPromptInput')?.value || '';
           const countInput = document.getElementById('variantCountSelect');
           const rawCount = parseInt(countInput?.value || '5', 10);
           const count = Number.isNaN(rawCount) ? 5 : Math.min(100, Math.max(1, rawCount));
@@ -1881,7 +2089,8 @@
             authorScope,
             count,
             state.pendingMaterialFiles,
-            trend
+            trend,
+            customPrompt
           );
 
           schoolData.generatedSets.push(generatedSet);
@@ -1903,20 +2112,32 @@
           const set = state.latestGeneratedSet;
           if (!set || !set.questions?.length) return;
 
-          const text = set.questions
-            .map((q) => {
-              return [
-                `${q.type}`,
-                q.stem,
-                '',
-                q.passage,
-                '',
-                ...q.choices,
-                `[정답] ${q.answer}`,
-                `[해설] ${q.explanation}`,
-              ].join('\n');
-            })
-            .join('\n\n----------------------------------------\n\n');
+          const headerLines = [];
+          if (set.customPrompt) {
+            headerLines.push(`[선생님 맞춤 출제 조건] ${set.customPrompt}`);
+            headerLines.push('');
+          }
+
+          const text =
+            headerLines.join('\n') +
+            set.questions
+              .map((q) => {
+                const originLine = q.originalSourceBadge ? `[원본문항] ${q.originalSourceBadge}` : null;
+                return [
+                  `${q.type}`,
+                  originLine,
+                  q.stem,
+                  '',
+                  q.passage,
+                  '',
+                  ...q.choices,
+                  `[정답] ${q.answer}`,
+                  `[해설] ${q.explanation}`,
+                ]
+                  .filter((line) => line !== null)
+                  .join('\n');
+              })
+              .join('\n\n----------------------------------------\n\n');
 
           let copied = false;
           try {
